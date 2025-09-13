@@ -13,12 +13,24 @@
 #include <linux/types.h>
 #include <linux/idr.h>
 #include <linux/printk.h>
+#include <linux/device.h>
+#include <linux/list.h>
 
 #define TACIT_NAME "tacit"
+#define TR_TE_CTRL 0x0
+#define TR_TE_CTRL_ENABLE_OFFSET 1
+#define TR_TE_INFO 0x4
+#define TR_TE_TARGET 0x20
+#define TR_TE_BRANCH_MODE 0x24
 
 #define TRACE_IOC_MAGIC      't'
-#define TRACE_IOC_ENABLE     _IOW(TRACE_IOC_MAGIC, 0, __u32)  /* arg: 1=on, 0=off */
+#define TRACE_IOC_ENABLE     _IO(TRACE_IOC_MAGIC, 0)  /* arg: 1=on, 0=off */
 #define TRACE_IOC_DISABLE    _IO(TRACE_IOC_MAGIC, 1)
+
+static LIST_HEAD(tacit_devices);
+static DEFINE_MUTEX(tacit_devices_lock);
+
+static DEFINE_IDA(traceenc_ida);
 
 /* Per-instance state */
 struct tacit_device {
@@ -26,43 +38,64 @@ struct tacit_device {
 	void __iomem *enc_base;
 	int id; // the hart 
 	struct miscdevice misc;
+	struct list_head device_entry;
 };
 
-static DEFINE_IDA(traceenc_ida);
+static struct tacit_device *tacit_dev_get(uint32_t minor)
+{
+	struct tacit_device *td;
+	list_for_each_entry(td, &tacit_devices, device_entry) {
+		if (td->misc.minor == minor)
+			return td;
+	}
+	return NULL;
+}
 
 /* Open the device */
 static int tacit_open(struct inode *inode, struct file *file)
 {
 	nonseekable_open(inode, file);
+
+	uint32_t minor = iminor(inode);
+	struct tacit_device *td = tacit_dev_get(minor);
+	if (!td)
+		return -ENXIO;
+	file->private_data = td;
 	return 0;
 }
 
 /* Handle ioctl commands*/
 static long tacit_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-	// struct tacit_device *td = container_of(file, struct tacit_device, misc);
-	u32 val;
-
+	struct tacit_device *td = file->private_data;
+	uint32_t curr;
 	if (_IOC_TYPE(cmd) != TRACE_IOC_MAGIC)
 		return -ENOTTY;
 	switch (cmd) {
 	case TRACE_IOC_ENABLE:
-		if (copy_from_user(&val, (void __user *)arg, sizeof(val)))
-			return -EFAULT;
-		printk(KERN_INFO "TACIT: enabled = %d\n", val);
+		curr = ioread32(td->enc_base + TR_TE_CTRL);
+		iowrite32(curr | 0x1 << TR_TE_CTRL_ENABLE_OFFSET, td->enc_base + TR_TE_CTRL);
 		return 0;
 	case TRACE_IOC_DISABLE:
-		printk(KERN_INFO "TACIT: disabled\n");
+		curr = ioread32(td->enc_base + TR_TE_CTRL);
+		iowrite32(curr & ~(0x1 << TR_TE_CTRL_ENABLE_OFFSET), td->enc_base + TR_TE_CTRL);
 		return 0;
 	default:
 		return -ENOTTY;
 	}
 }
 
+static int tacit_release(struct inode *inode, struct file *file)
+{
+	file->private_data = NULL;
+	return 0;
+}
+
 static const struct file_operations tacit_fops = {
 	.owner          = THIS_MODULE,
 	.open           = tacit_open,
 	.unlocked_ioctl = tacit_ioctl,
+	.release        = tacit_release,
 };
 
 /* Probe the device */
@@ -77,6 +110,11 @@ static int tacit_probe(struct platform_device *pdev)
 	// Allocate memory for a new device
 	td = devm_kzalloc(&pdev->dev, sizeof(*td), GFP_KERNEL);
 	if (!td) return -ENOMEM;
+
+	INIT_LIST_HEAD(&td->device_entry);
+	mutex_lock(&tacit_devices_lock);
+	list_add(&td->device_entry, &tacit_devices);
+	mutex_unlock(&tacit_devices_lock);
 
 	// Allocate an ID for the device
 	td->id = ida_simple_get(&traceenc_ida, 0, 0, GFP_KERNEL);
