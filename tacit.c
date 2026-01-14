@@ -36,10 +36,9 @@
 
 #define TRACE_IOC_MAGIC      't'
 // --- IOCTL commands ---
-// Enable the trace encoder
-#define TRACE_IOC_ENABLE     _IO(TRACE_IOC_MAGIC, 0)
-// Disable the trace encoder
-#define TRACE_IOC_DISABLE    _IO(TRACE_IOC_MAGIC, 1)
+#define TRACE_IOC_ENABLE      _IO(TRACE_IOC_MAGIC, 0)
+#define TRACE_IOC_DISABLE     _IO(TRACE_IOC_MAGIC, 1)
+#define TRACE_IOC_TARGET			_IOW(TRACE_IOC_MAGIC, 2, __u8)
 
 /* Per-instance state */
 struct tacit_device {
@@ -124,7 +123,15 @@ static void tacit_log_new_task(struct tacit_device *td, struct task_struct *p)
 		return;
 
 	record->pid = p->pid;
-	record->asid = cntx2asid(atomic_long_read(&p->mm->context.id));
+	int asid = cntx2asid(atomic_long_read(&p->mm->context.id));
+
+	// reject if asid is 0, this is not a user-space task
+	if (asid == 0) {
+		kfree(record);
+		return;
+	}
+
+	record->asid = asid;
 	atomic_set(&record->seen_gen, 0);
 	strscpy(record->comm, p->comm, sizeof(record->comm));
 
@@ -287,6 +294,9 @@ static long tacit_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case TRACE_IOC_DISABLE:
 		tacit_encoder_set(td, false);
 		return 0;
+	case TRACE_IOC_TARGET:
+		iowrite32(arg, td->enc_base + TR_TE_TARGET);
+		return 0;
 	default:
 		return -ENOTTY;
 	}
@@ -388,12 +398,30 @@ static void tacit_on_exec(void *ignore, struct task_struct *p, pid_t old_pid,
 	if (!td->encoder_enabled) return;
 	// assert that the asid is not already registered
 	int asid = cntx2asid(atomic_long_read(&p->mm->context.id));
+	if (asid == 0) return;
 	if (rhashtable_lookup_fast(&td->log_table, &asid, tacit_log_record_params) != NULL) {
-		pr_err("[TACIT Kernel Driver] asid %d is already registered\n", p->pid);
+		// pr_err("[TACIT Kernel Driver] asid %d is already registered, pid=%d try will be ignored\n", asid, p->pid);
 		return;
 	}
 	tacit_log_new_task(td, p);
 }
+
+// static void tacit_on_fork(void *ignore, struct task_struct *parent, struct task_struct *child)
+// {
+// 	int cpu = smp_processor_id();
+// 	struct tacit_device *td = tacit_get_device(cpu);
+// 	if (!td || !child || !child->mm) return;
+// 	if (!td->encoder_enabled) return;
+// 	int asid = cntx2asid(atomic_long_read(&child->mm->context.id));
+// 	int parent_asid = cntx2asid(atomic_long_read(&parent->mm->context.id));
+// 	printk("parent_asid: %d, child_asid: %d\n", parent_asid, asid);
+// 	if (asid == 0) return;
+// 	if (rhashtable_lookup_fast(&td->log_table, &asid, tacit_log_record_params) != NULL) {
+// 		pr_err("[TACIT Kernel Driver] asid %d is already registered, pid=%d try will be ignored\n", asid, child->pid);
+// 		return;
+// 	}
+// 	tacit_log_new_task(td, child);
+// }
 
 static void tacit_on_sched_switch(void *ignore,
 	bool preempt, struct task_struct *prev, struct task_struct *next, unsigned int prev_state)
@@ -404,6 +432,7 @@ static void tacit_on_sched_switch(void *ignore,
 	if (!td->encoder_enabled) return;
 	// check if the asid is registered
 	int asid = cntx2asid(atomic_long_read(&next->mm->context.id));
+	if (asid == 0) return;
 	struct tacit_log_record *record = rhashtable_lookup_fast(&td->log_table, &asid, tacit_log_record_params);
 	if (!record) {
 		tacit_log_new_task(td, next);
@@ -430,12 +459,17 @@ static int __init tacit_init(void)
 	int ret;
 	
 	register_trace_sched_switch(tacit_on_sched_switch, NULL);
+	// register_trace_sched_process_fork(tacit_on_fork, NULL);
 	register_trace_sched_process_exec(tacit_on_exec, NULL);
 	// debug check
 	if (!trace_sched_process_exec_enabled()) {
 		pr_err("[TACIT Kernel Driver] sched_process_exec is not enabled\n");
 		return -EINVAL;
 	}
+	// if (!trace_sched_process_fork_enabled()) {
+	// 	pr_err("[TACIT Kernel Driver] sched_process_fork is not enabled\n");
+	// 	return -EINVAL;
+	// }
 	if (!trace_sched_switch_enabled()) {
 		pr_err("[TACIT Kernel Driver] sched_switch is not enabled\n");
 		return -EINVAL;
@@ -444,6 +478,7 @@ static int __init tacit_init(void)
 	ret = platform_driver_register(&tacit_driver);
 	if (ret) {
 		unregister_trace_sched_switch(tacit_on_sched_switch, NULL);
+		// unregister_trace_sched_process_fork(tacit_on_fork, NULL);
 		unregister_trace_sched_process_exec(tacit_on_exec, NULL);
 		return ret;
 	}
