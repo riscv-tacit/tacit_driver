@@ -40,6 +40,11 @@
 #define TRACE_IOC_DISABLE     _IO(TRACE_IOC_MAGIC, 1)
 #define TRACE_IOC_TARGET			_IOW(TRACE_IOC_MAGIC, 2, __u8)
 
+#define TRACE_EXEC
+#define TRACE_SCHED_SWITCH
+
+#define DEBUG_TACIT 1
+
 /* Per-instance state */
 struct tacit_device {
 	struct device *dev;
@@ -389,6 +394,7 @@ static inline struct tacit_device *tacit_get_device(long cpu)
 	return NULL;
 }
 
+#ifdef TRACE_EXEC
 static void tacit_on_exec(void *ignore, struct task_struct *p, pid_t old_pid,
 	struct linux_binprm *bprm)
 {
@@ -396,7 +402,6 @@ static void tacit_on_exec(void *ignore, struct task_struct *p, pid_t old_pid,
 	struct tacit_device *td = tacit_get_device(cpu);
 	if (!td || !p || !p->mm) return;
 	if (!td->encoder_enabled) return;
-	// assert that the asid is not already registered
 	int asid = cntx2asid(atomic_long_read(&p->mm->context.id));
 	if (asid == 0) return;
 	if (rhashtable_lookup_fast(&td->log_table, &asid, tacit_log_record_params) != NULL) {
@@ -405,6 +410,7 @@ static void tacit_on_exec(void *ignore, struct task_struct *p, pid_t old_pid,
 	}
 	tacit_log_new_task(td, p);
 }
+#endif
 
 // static void tacit_on_fork(void *ignore, struct task_struct *parent, struct task_struct *child)
 // {
@@ -423,6 +429,7 @@ static void tacit_on_exec(void *ignore, struct task_struct *p, pid_t old_pid,
 // 	tacit_log_new_task(td, child);
 // }
 
+#ifdef TRACE_SCHED_SWITCH
 static void tacit_on_sched_switch(void *ignore,
 	bool preempt, struct task_struct *prev, struct task_struct *next, unsigned int prev_state)
 {
@@ -438,6 +445,7 @@ static void tacit_on_sched_switch(void *ignore,
 		tacit_log_new_task(td, next);
 	}
 }
+#endif
 
 static struct of_device_id tacit_of_match[] = {
 	{ .compatible = "ucb-bar,trace" },
@@ -458,9 +466,12 @@ static int __init tacit_init(void)
 {
 	int ret;
 	
+	#ifdef TRACE_SCHED_SWITCH
 	register_trace_sched_switch(tacit_on_sched_switch, NULL);
-	// register_trace_sched_process_fork(tacit_on_fork, NULL);
+	#endif
+	#ifdef TRACE_EXEC
 	register_trace_sched_process_exec(tacit_on_exec, NULL);
+	#endif
 	// debug check
 	if (!trace_sched_process_exec_enabled()) {
 		pr_err("[TACIT Kernel Driver] sched_process_exec is not enabled\n");
@@ -477,9 +488,12 @@ static int __init tacit_init(void)
 	
 	ret = platform_driver_register(&tacit_driver);
 	if (ret) {
+		#ifdef TRACE_SCHED_SWITCH
 		unregister_trace_sched_switch(tacit_on_sched_switch, NULL);
-		// unregister_trace_sched_process_fork(tacit_on_fork, NULL);
+		#endif
+		#ifdef TRACE_EXEC
 		unregister_trace_sched_process_exec(tacit_on_exec, NULL);
+		#endif
 		return ret;
 	}
 	
@@ -499,8 +513,12 @@ static void __exit tacit_exit(void)
 		rhashtable_free_and_destroy(&td->log_table, tacit_log_record_free, NULL);
 	}
 	platform_driver_unregister(&tacit_driver);
+	#ifdef TRACE_SCHED_SWITCH
 	unregister_trace_sched_switch(tacit_on_sched_switch, NULL);
+	#endif
+	#ifdef TRACE_EXEC
 	unregister_trace_sched_process_exec(tacit_on_exec, NULL);
+	#endif
 }
 
 module_init(tacit_init);
