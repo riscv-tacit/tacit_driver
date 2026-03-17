@@ -24,38 +24,16 @@
 #include <linux/bitops.h>
 #include <linux/sched/task.h>
 #include <linux/rhashtable.h>
+#include <linux/io-64-nonatomic-lo-hi.h>
 #include <asm/mmu.h>
 #include <trace/events/sched.h>
 
-#define TACIT_NAME "tacit"
-#define TR_TE_CTRL 0x0
-#define TR_TE_CTRL_ENABLE_OFFSET 1
-#define TR_TE_INFO 0x4
-#define TR_TE_TARGET 0x20
-#define TR_TE_BRANCH_MODE 0x24
-
-#define TRACE_IOC_MAGIC      't'
-// --- IOCTL commands ---
-#define TRACE_IOC_ENABLE      _IO(TRACE_IOC_MAGIC, 0)
-#define TRACE_IOC_DISABLE     _IO(TRACE_IOC_MAGIC, 1)
-#define TRACE_IOC_TARGET			_IOW(TRACE_IOC_MAGIC, 2, __u8)
+#include "tacit_internal.h"
 
 #define TRACE_EXEC
 #define TRACE_SCHED_SWITCH
 
 #define DEBUG_TACIT 1
-
-/* Per-instance state */
-struct tacit_device {
-	struct device *dev;
-	void __iomem *enc_base;
-	int id; // the hart id 
-	struct miscdevice misc;
-	bool encoder_enabled;
-	struct list_head device_entry;
-	struct rhashtable log_table;
-	wait_queue_head_t log_wait;
-};
 
 struct tacit_log_record {
 	// this is the key
@@ -89,6 +67,7 @@ static const struct rhashtable_params tacit_log_record_params = {
 	.key_len     = sizeof(int),
 	.key_offset  = offsetof(struct tacit_log_record, asid),
 	.head_offset = offsetof(struct tacit_log_record, linkage),
+	.nelem_hint  = 1024,
 };
 
 static LIST_HEAD(tacit_devices);
@@ -123,7 +102,7 @@ static void tacit_log_new_task(struct tacit_device *td, struct task_struct *p)
 		return;
 
 	// allocate a new record on the heap
-	struct tacit_log_record *record = kmalloc(sizeof(*record), GFP_KERNEL);
+	struct tacit_log_record *record = kmalloc(sizeof(*record), GFP_ATOMIC);
 	if (!record)
 		return;
 
@@ -140,7 +119,12 @@ static void tacit_log_new_task(struct tacit_device *td, struct task_struct *p)
 	atomic_set(&record->seen_gen, 0);
 	strscpy(record->comm, p->comm, sizeof(record->comm));
 
-	rhashtable_insert_fast(&td->log_table, &record->linkage, tacit_log_record_params);
+	int ret = rhashtable_insert_fast(&td->log_table, &record->linkage, tacit_log_record_params);
+	if (ret) {
+		kfree(record);
+		pr_err("[TACIT Kernel Driver] failed to insert record into hashtable: %d\n", ret);
+		return;
+	}
 }
 
 static ssize_t tacit_read(struct file *file, char __user *buf, size_t len, loff_t *ppos)
@@ -300,8 +284,34 @@ static long tacit_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		tacit_encoder_set(td, false);
 		return 0;
 	case TRACE_IOC_TARGET:
+	{
+		int ret = tacit_dma_prepare_for_target(td, arg);
+		if (ret)
+			return ret;
 		iowrite32(arg, td->enc_base + TR_TE_TARGET);
 		return 0;
+	}
+	case TRACE_IOC_STALL_COUNT:
+	{
+		u64 stall_count = ioread64_lo_hi(td->enc_base + TR_TE_STALL_COUNT);
+		if (copy_to_user((void __user *)arg, &stall_count, sizeof(stall_count)))
+			return -EFAULT;
+		return 0;
+	}
+	case TRACE_IOC_DMA_COUNT:
+	{
+		u64 dma_count = ioread64_lo_hi(td->dma->base + TR_SK_DMA_COUNT);
+		if (copy_to_user((void __user *)arg, &dma_count, sizeof(dma_count)))
+			return -EFAULT;
+		return 0;
+	}
+	case TRACE_IOC_DMA_WRAP_COUNT:
+	{
+		u64 dma_wrap_count = ioread64_lo_hi(td->dma->base + TR_SK_DMA_WRAP_COUNT);
+		if (copy_to_user((void __user *)arg, &dma_wrap_count, sizeof(dma_wrap_count)))
+			return -EFAULT;
+		return 0;
+	}
 	default:
 		return -ENOTTY;
 	}
@@ -330,6 +340,11 @@ static const struct file_operations tacit_fops = {
 	.release        = tacit_release,
 };
 
+static void tacit_log_record_free(void *ptr, void *arg)
+{
+	kfree(ptr);
+}
+
 /* Probe the device */
 static int tacit_probe(struct platform_device *pdev)
 {
@@ -338,49 +353,108 @@ static int tacit_probe(struct platform_device *pdev)
 	struct device_node *node = pdev->dev.of_node;
 	struct resource regs;
 	int err;
+	bool list_added = false;
+	bool misc_registered = false;
+	bool log_inited = false;
+	bool id_allocated = false;
 
 	// Allocate memory for a new device
 	td = devm_kzalloc(&pdev->dev, sizeof(*td), GFP_KERNEL);
-	if (!td) return -ENOMEM;
+	if (!td)
+		return -ENOMEM;
+	td->dev = dev;
 
 	INIT_LIST_HEAD(&td->device_entry);
 	mutex_lock(&tacit_devices_lock);
 	td->encoder_enabled = false;
-		// Allocate an ID for the device
+	// Allocate an ID for the device
 	td->id = ida_simple_get(&traceenc_ida, 0, 0, GFP_KERNEL);
-	if (td->id < 0) return td->id;
+	if (td->id < 0) {
+		err = td->id;
+		goto err_unlock;
+	}
+	id_allocated = true;
 
 	init_waitqueue_head(&td->log_wait);
 	if (rhashtable_init(&td->log_table, &tacit_log_record_params)) {
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto err_id;
 	}
+	log_inited = true;
 	
 	// Get the register base address
 	err = of_address_to_resource(node, 0, &regs);
 	if (err) {
 		dev_err(dev, "missing \"reg\" property\n");
-		return err;
+		goto err_log;
 	}
 	td->enc_base = devm_ioremap_resource(&pdev->dev, &regs);
-	if (IS_ERR(td->enc_base)) return PTR_ERR(td->enc_base);
+	if (IS_ERR(td->enc_base)) {
+		err = PTR_ERR(td->enc_base);
+		goto err_log;
+	}
+
+	err = tacit_dma_init(td, dev, node);
+	if (err) {
+		dev_err(dev, "tacit DMA init failed: %d\n", err);
+		goto err_log;
+	}
 
 	// Register a misc device
 	td->misc.minor = MISC_DYNAMIC_MINOR;
 	td->misc.name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "tacit%d", td->id);
 	td->misc.fops = &tacit_fops;
 	td->misc.mode = 0660;
+	if (!td->misc.name) {
+		err = -ENOMEM;
+		goto err_dma;
+	}
 	if (misc_register(&td->misc) < 0) {
 		dev_err(&pdev->dev, "Failed to register misc device\n");
-		return -EBUSY;
+		err = -EBUSY;
+		goto err_dma;
 	}
+	misc_registered = true;
 
 	list_add(&td->device_entry, &tacit_devices);
+	list_added = true;
 	mutex_unlock(&tacit_devices_lock);
-
 
 	platform_set_drvdata(pdev, td);
 	dev_info(&pdev->dev, "TACIT device registered, minor=%d, id = %d\n", td->misc.minor, td->id);
 	return 0;
+
+err_dma:
+	tacit_dma_deinit(td);
+err_log:
+	if (log_inited)
+		rhashtable_free_and_destroy(&td->log_table, tacit_log_record_free, NULL);
+err_id:
+	if (id_allocated)
+		ida_simple_remove(&traceenc_ida, td->id);
+err_unlock:
+	if (misc_registered)
+		misc_deregister(&td->misc);
+	if (list_added)
+		list_del(&td->device_entry);
+	mutex_unlock(&tacit_devices_lock);
+	return err;
+}
+
+static void tacit_remove(struct platform_device *pdev)
+{
+	struct tacit_device *td = platform_get_drvdata(pdev);
+
+	if (!td)
+		return;
+
+	mutex_lock(&tacit_devices_lock);
+	list_del(&td->device_entry);
+	misc_deregister(&td->misc);
+	tacit_dma_deinit(td);
+	rhashtable_free_and_destroy(&td->log_table, tacit_log_record_free, NULL);
+	ida_simple_remove(&traceenc_ida, td->id);
+	mutex_unlock(&tacit_devices_lock);
 }
 
 static inline struct tacit_device *tacit_get_device(long cpu)
@@ -460,6 +534,7 @@ static struct platform_driver tacit_driver = {
 		.suppress_bind_attrs = true
 	},
 	.probe = tacit_probe,
+	.remove = tacit_remove,
 };
 
 static int __init tacit_init(void)
@@ -500,18 +575,8 @@ static int __init tacit_init(void)
 	return 0;
 }
 
-static void tacit_log_record_free(void *ptr, void *arg)
-{
-	kfree(ptr);
-}
-
 static void __exit tacit_exit(void)
 {
-	// iterate over the list of devices
-	struct tacit_device *td;
-	list_for_each_entry(td, &tacit_devices, device_entry) {
-		rhashtable_free_and_destroy(&td->log_table, tacit_log_record_free, NULL);
-	}
 	platform_driver_unregister(&tacit_driver);
 	#ifdef TRACE_SCHED_SWITCH
 	unregister_trace_sched_switch(tacit_on_sched_switch, NULL);
