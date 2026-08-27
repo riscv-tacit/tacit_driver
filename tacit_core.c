@@ -88,11 +88,30 @@ static void tacit_encoder_set(struct tacit_device *td, bool enable)
 		return;
 
 	ctrl = ioread32(td->enc_base + TR_TE_CTRL);
-	if (enable)
+	if (enable) {
 		ctrl |= BIT(TR_TE_CTRL_ENABLE_OFFSET);
-	else
+		iowrite32(ctrl, td->enc_base + TR_TE_CTRL);
+		/*
+		 * Read back so the encoder is running at the device before
+		 * the marker commits: the TraceDoctor oracle window (opened
+		 * by the marker) must sit strictly inside the TACIT window.
+		 * Marker encodings must match the TracerV insn trigger
+		 * plusargs (+trace-start/+trace-end) and tests/tacit.h.
+		 */
+		ioread32(td->enc_base + TR_TE_CTRL);
+		asm volatile("slti x0, x0, 0x5A5"); /* window-start marker */
+	} else {
+		/*
+		 * Window-stop marker, issued 4x so one lands in each commit
+		 * slot on bitstreams predating the TracerV trigger-arm fix.
+		 */
+		asm volatile("slti x0, x0, 0x5AD");
+		asm volatile("slti x0, x0, 0x5AD");
+		asm volatile("slti x0, x0, 0x5AD");
+		asm volatile("slti x0, x0, 0x5AD");
 		ctrl &= ~BIT(TR_TE_CTRL_ENABLE_OFFSET);
-	iowrite32(ctrl, td->enc_base + TR_TE_CTRL);
+		iowrite32(ctrl, td->enc_base + TR_TE_CTRL);
+	}
 	WRITE_ONCE(td->encoder_enabled, enable);
 }
 
@@ -307,8 +326,15 @@ static long tacit_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	}
 	case TRACE_IOC_DMA_WRAP_COUNT:
 	{
-		u64 dma_wrap_count = ioread64_lo_hi(td->dma->base + TR_SK_DMA_WRAP_COUNT);
+		int dma_wrap_count = ioread32(td->dma->base + TR_SK_DMA_WRAP_COUNT);
 		if (copy_to_user((void __user *)arg, &dma_wrap_count, sizeof(dma_wrap_count)))
+			return -EFAULT;
+		return 0;
+	}
+	case TRACE_IOC_DMA_SRC_RDY_STALL_COUNT:
+	{
+		int dma_src_rdy_stall_count = ioread32(td->dma->base + TR_SK_DMA_SRC_RDY_STALL_COUNT);
+		if (copy_to_user((void __user *)arg, &dma_src_rdy_stall_count, sizeof(dma_src_rdy_stall_count)))
 			return -EFAULT;
 		return 0;
 	}
