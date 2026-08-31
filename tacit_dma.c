@@ -11,6 +11,20 @@
 /* Internal-only DMA staging buffer size. */
 #define TACIT_DMA_DEFAULT_SIZE SZ_4M
 
+/* 0 = overflow (default: the first buffer-full is a decodable trace prefix,
+ * extractable with FireSim's +dumpmem), 1 = ring (keeps the newest window,
+ * sustains backpressure forever, but wraps destroy decodability). */
+static int dma_mode = 0;
+module_param(dma_mode, int, 0444);
+MODULE_PARM_DESC(dma_mode, "trace DMA sink mode: 0=overflow, 1=ring");
+
+/* Buffer size in MiB. >4 requires CONFIG_DMA_CMA (contiguous alloc); pass
+ * tacit.dma_size_mb=N on the kernel cmdline. Size it to hold the whole trace
+ * so the overflow-mode prefix is the complete stream. */
+static int dma_size_mb = 4;
+module_param(dma_size_mb, int, 0444);
+MODULE_PARM_DESC(dma_size_mb, "trace DMA buffer size in MiB (default 4)");
+
 static int tacit_dma_hw_reset(struct tacit_dma_dev *d)
 {
 	if (!d || !d->base)
@@ -75,8 +89,7 @@ int tacit_dma_init(struct tacit_device *td, struct device *dev, struct device_no
 
 	d->np = dma_np;
 	mutex_init(&d->lock);
-	d->mode = DMA_MODE_RING_BUFFER;
-	// d->mode = DMA_MODE_OVERFLOW;
+	d->mode = dma_mode ? DMA_MODE_RING_BUFFER : DMA_MODE_OVERFLOW;
 	d->configured = false;
 
 	ret = of_address_to_resource(dma_np, 0, &dma_res);
@@ -102,7 +115,7 @@ int tacit_dma_init(struct tacit_device *td, struct device *dev, struct device_no
 		return ret;
 	}
 
-	d->size = TACIT_DMA_DEFAULT_SIZE;
+	d->size = (dma_size_mb > 0) ? ((size_t)dma_size_mb << 20) : TACIT_DMA_DEFAULT_SIZE;
 	d->cpu_addr = dma_alloc_coherent(dev, d->size, &d->dma_addr, GFP_KERNEL);
 	if (!d->cpu_addr) {
 		dev_err(dev, "dma_alloc_coherent failed for %zu bytes\n", d->size);

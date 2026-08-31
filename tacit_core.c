@@ -317,6 +317,34 @@ static long tacit_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			return -EFAULT;
 		return 0;
 	}
+	case TRACE_IOC_LOSSY:
+	{
+		if (READ_ONCE(td->encoder_enabled))
+			return -EBUSY;
+		iowrite32(arg & 0x1, td->enc_base + TR_TE_LOSSY);
+		return 0;
+	}
+	case TRACE_IOC_GAP_CYCLES:
+	{
+		u64 v = ioread64_lo_hi(td->enc_base + TR_TE_GAP_CYCLES);
+		if (copy_to_user((void __user *)arg, &v, sizeof(v)))
+			return -EFAULT;
+		return 0;
+	}
+	case TRACE_IOC_DROPPED_PACKETS:
+	{
+		u64 v = ioread64_lo_hi(td->enc_base + TR_TE_DROPPED_PACKETS);
+		if (copy_to_user((void __user *)arg, &v, sizeof(v)))
+			return -EFAULT;
+		return 0;
+	}
+	case TRACE_IOC_PAUSE_COUNT:
+	{
+		u64 v = ioread64_lo_hi(td->enc_base + TR_TE_PAUSE_COUNT);
+		if (copy_to_user((void __user *)arg, &v, sizeof(v)))
+			return -EFAULT;
+		return 0;
+	}
 	case TRACE_IOC_DMA_COUNT:
 	{
 		u64 dma_count = ioread64_lo_hi(td->dma->base + TR_SK_DMA_COUNT);

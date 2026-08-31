@@ -19,7 +19,12 @@
 #define TR_TE_INFO 0x4
 #define TR_TE_TARGET 0x20
 #define TR_TE_BRANCH_MODE 0x24
-#define TR_TE_STALL_COUNT 0x28
+#define TR_TE_STALL_COUNT 0x28 /* cycles the packet queues were at the high watermark ("full") */
+#define TR_TE_FULL_COUNT TR_TE_STALL_COUNT
+#define TR_TE_LOSSY 0x30       /* bit 0: pause/resume instead of stalling the core */
+#define TR_TE_GAP_CYCLES 0x38  /* cycles inside Pause..Resume gaps */
+#define TR_TE_DROPPED_PACKETS 0x40
+#define TR_TE_PAUSE_COUNT 0x48
 
 #define TRACE_IOC_MAGIC      't'
 #define TRACE_IOC_ENABLE      _IO(TRACE_IOC_MAGIC, 0)
@@ -29,6 +34,12 @@
 #define TRACE_IOC_DMA_COUNT   _IOR(TRACE_IOC_MAGIC, 4, __u64)
 #define TRACE_IOC_DMA_WRAP_COUNT _IOR(TRACE_IOC_MAGIC, 5, __u32)
 #define TRACE_IOC_DMA_SRC_RDY_STALL_COUNT _IOR(TRACE_IOC_MAGIC, 6, __u32)
+/* Lossy mode. Must be set while the encoder is disabled (-EBUSY otherwise):
+ * the encoder assumes lossy never changes between enable and disable. */
+#define TRACE_IOC_LOSSY           _IOW(TRACE_IOC_MAGIC, 7, __u32)
+#define TRACE_IOC_GAP_CYCLES      _IOR(TRACE_IOC_MAGIC, 8, __u64)
+#define TRACE_IOC_DROPPED_PACKETS _IOR(TRACE_IOC_MAGIC, 9, __u64)
+#define TRACE_IOC_PAUSE_COUNT     _IOR(TRACE_IOC_MAGIC, 10, __u64)
 
 
 #define TARGET_DMA 1
