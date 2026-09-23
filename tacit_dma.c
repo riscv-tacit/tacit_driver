@@ -11,10 +11,17 @@
 /* Internal-only DMA staging buffer size. */
 #define TACIT_DMA_DEFAULT_SIZE SZ_4M
 
-/* 0 = overflow (default: the first buffer-full is a decodable trace prefix,
- * extractable with FireSim's +dumpmem), 1 = ring (keeps the newest window,
- * sustains backpressure forever, but wraps destroy decodability). */
-static int dma_mode = 0;
+/* 0 = overflow: the first buffer-full is a decodable trace prefix, extractable
+ * with FireSim's +dumpmem -- but once full the sink asserts ready and discards
+ * unconditionally, so it stops backpressuring the encoder entirely.
+ * 1 = ring (default): keeps the newest window and sustains real DRAM-bandwidth
+ * backpressure for the whole run, at the cost of wraps destroying decodability.
+ * Ring is the default because overhead and lossy-mode coverage measurements are
+ * only meaningful under sustained backpressure; overflow makes the encoder look
+ * arbitrarily good once past the first bufferful. For a decodable DMA capture,
+ * load with dma_mode=0 (modprobe option -- the kernel cmdline does not reach a
+ * loadable module). */
+static int dma_mode = 1;
 module_param(dma_mode, int, 0444);
 MODULE_PARM_DESC(dma_mode, "trace DMA sink mode: 0=overflow, 1=ring");
 

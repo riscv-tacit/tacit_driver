@@ -324,6 +324,21 @@ static long tacit_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		iowrite32(arg & 0x1, td->enc_base + TR_TE_LOSSY);
 		return 0;
 	}
+	case TRACE_IOC_RESUME_WM:
+	{
+		if (READ_ONCE(td->encoder_enabled))
+			return -EBUSY;
+		iowrite32(arg, td->enc_base + TR_TE_RESUME_WM);
+		return 0;
+	}
+	case TRACE_IOC_GET_RESUME_WM:
+	{
+		/* Effective value after the encoder's default/clamp, not the raw write. */
+		u32 v = ioread32(td->enc_base + TR_TE_RESUME_WM);
+		if (copy_to_user((void __user *)arg, &v, sizeof(v)))
+			return -EFAULT;
+		return 0;
+	}
 	case TRACE_IOC_GAP_CYCLES:
 	{
 		u64 v = ioread64_lo_hi(td->enc_base + TR_TE_GAP_CYCLES);

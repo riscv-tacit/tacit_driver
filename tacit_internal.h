@@ -25,6 +25,13 @@
 #define TR_TE_GAP_CYCLES 0x38  /* cycles inside Pause..Resume gaps */
 #define TR_TE_DROPPED_PACKETS 0x40
 #define TR_TE_PAUSE_COUNT 0x48
+#define TR_TE_DROPPED_INSNS 0x50
+/* Lossy resume watermark, absolute queue entries. 0 selects the encoder's
+ * elaboration default. Reads back the EFFECTIVE value after the encoder clamps
+ * below the drop threshold, so writing ~0 and reading back yields this build's
+ * legal maximum. Absent on bitstreams built before 2026-09-07: those decode the
+ * address but have no register there, so a write is dropped and a read is 0. */
+#define TR_TE_RESUME_WM 0x58
 
 #define TRACE_IOC_MAGIC      't'
 #define TRACE_IOC_ENABLE      _IO(TRACE_IOC_MAGIC, 0)
@@ -40,6 +47,11 @@
 #define TRACE_IOC_GAP_CYCLES      _IOR(TRACE_IOC_MAGIC, 8, __u64)
 #define TRACE_IOC_DROPPED_PACKETS _IOR(TRACE_IOC_MAGIC, 9, __u64)
 #define TRACE_IOC_PAUSE_COUNT     _IOR(TRACE_IOC_MAGIC, 10, __u64)
+/* Resume watermark. Set while disabled only (-EBUSY otherwise), mirroring
+ * TRACE_IOC_LOSSY: one watermark per traced run keeps every counter attributable
+ * to a single configuration. */
+#define TRACE_IOC_RESUME_WM       _IOW(TRACE_IOC_MAGIC, 11, __u32)
+#define TRACE_IOC_GET_RESUME_WM   _IOR(TRACE_IOC_MAGIC, 12, __u32)
 
 
 #define TARGET_DMA 1
