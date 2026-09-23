@@ -547,8 +547,17 @@ static void tacit_on_exec(void *ignore, struct task_struct *p, pid_t old_pid,
 	if (!td->encoder_enabled) return;
 	int asid = cntx2asid(atomic_long_read(&p->mm->context.id));
 	if (asid == 0) return;
-	if (rhashtable_lookup_fast(&td->log_table, &asid, tacit_log_record_params) != NULL) {
-		// pr_err("[TACIT Kernel Driver] asid %d is already registered, pid=%d try will be ignored\n", asid, p->pid);
+	/* exec is authoritative for this asid: the mm was created by this exec and
+	 * belongs to p under its new name. The sched_switch hook may already have
+	 * registered the asid -- begin_new_exec() installs the new mm (exec_mmap)
+	 * well before it renames the task (__set_task_comm), and a switch-out in
+	 * between records the OLD comm. Observed on a posix_spawn launcher: 248 of
+	 * 257 children labelled with the launcher's name. So update, do not skip. */
+	struct tacit_log_record *record =
+		rhashtable_lookup_fast(&td->log_table, &asid, tacit_log_record_params);
+	if (record) {
+		record->pid = p->pid;
+		strscpy(record->comm, p->comm, sizeof(record->comm));
 		return;
 	}
 	tacit_log_new_task(td, p);
